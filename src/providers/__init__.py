@@ -1,4 +1,4 @@
-"""Contracts and implementations for market-data providers."""
+"""Contracts for market-data provider implementations."""
 
 from .base_provider import BaseProvider
 
