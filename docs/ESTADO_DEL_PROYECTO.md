@@ -97,24 +97,62 @@ Responsable de guardar, leer y actualizar `MarketBar`. **Nunca** habla con provi
 
 **Para qué sirve:** cierra el círculo `Provider → MarketBar → DataManager → Parquet`. Es la pieza que, en la práctica, "rellena" `data/` con información real de mercado.
 
-### 4.5. Tests — `tests/`
+### 4.5. Capa de features — `src/features/`
+
+Convierte velas OHLCV crudas (las que persiste `DataManager`) en variables numéricas listas para un modelo de ML. **Nunca** habla con providers, repositorios ni sabe para qué modelo se van a usar las columnas que produce.
+
+- **`base_feature_calculator.py`** — `FeatureCalculator`: contrato abstracto. Define `compute(bars) -> DataFrame`: recibe una secuencia de `MarketBar` en cualquier orden y devuelve un DataFrame indexado por `timestamp` (UTC, cronológico) con las columnas OHLCV originales más una columna por feature calculada.
+- **`indicator_config.py`** — `IndicatorConfig`: dataclass inmutable con todas las ventanas y parámetros (periodos de SMA/EMA, RSI, MACD, Bollinger, ATR, Stochastic, ADX, MFI, retornos, volumen relativo). Centraliza la configuración para no tener números mágicos repartidos por el código.
+- **`technical_indicators.py`** — `TechnicalIndicatorCalculator`: implementación concreta de `FeatureCalculator` sobre `pandas-ta-classic`. Calcula, por categoría:
+  - **Tendencia:** SMA, EMA (expresadas como `sma_N_dist`/`ema_N_dist`, la distancia relativa del precio a la media, no el valor absoluto — ver nota más abajo), ADX + DI+/DI-.
+  - **Momentum:** RSI, MACD, Stochastic Oscillator, MFI.
+  - **Volatilidad:** Bollinger Bands (expresadas como `bb_percent_b` y `bb_bandwidth`, no como bandas en crudo — misma razón que SMA/EMA), ATR.
+  - **Volumen:** OBV, volumen relativo (volumen actual vs. su media móvil).
+  - **Retornos pasados:** log-retorno sobre varias ventanas configurables (`return_1`, `return_3`...).
+  - **Temporales:** hora del día y día de la semana codificados cíclicamente con seno/coseno (`hour_sin`/`hour_cos`, `dow_sin`/`dow_cos`, a partir del `timestamp` UTC) y sesión de mercado one-hot (`session_asia`, `session_europe`, `session_us`, `session_off`), con los límites horarios de cada sesión configurables en `IndicatorConfig`. Capturan patrones ligados a la sesión horaria y al día de la semana, relevantes incluso en un mercado 24/7 como cripto por diferencias de volumen/volatilidad entre sesiones.
+
+  Las filas anteriores a que se llene la ventana de lookback de un indicador quedan en `NaN` para esa columna — es el comportamiento esperado, no un error, y lo resuelve la siguiente capa (`datasets/`) al construir la tabla de entrenamiento.
+
+  **Por qué SMA/EMA/Bollinger van en relativo y no en crudo:** una inspección del dataset real (`X`/`y` sobre BTC/USDT) mostró que `sma_20` y `bb_mid` correlacionaban 1.000 entre sí — son literalmente el mismo número (la media móvil de 20 periodos), y todo el bloque SMA/EMA/Bollinger correlacionaba por encima de 0.99. La causa es que, aunque ya excluimos el OHLCV crudo de `X` (ver [4.6](#46-capa-de-datasets--srcdatasets)), estos tres indicadores seguían siendo versiones suavizadas del precio absoluto en dólares — el mismo problema de escala entre instrumentos que justificó excluir el precio crudo, solo que disfrazado dentro de un indicador. La corrección: expresarlos como distancia relativa al precio (`(close - sma) / sma`) y como los derivados estándar de Bollinger (`%B` y ancho de banda), que son adimensionales y sí generalizan entre instrumentos con escalas de precio distintas. MACD y ATR no se tocaron: el mismo análisis no mostró evidencia de redundancia ahí, y "arreglarlos" sin datos que lo justifiquen sería sobre-diseñar — se revisarán si en el futuro aparece evidencia similar.
+
+**Para qué sirve:** las velas crudas no sirven directamente para entrenar un modelo. Esta capa es la que produce las variables predictivas (features), manteniendo pandas y `pandas-ta-classic` como detalle de implementación confinado a esta clase — el resto del sistema solo ve `MarketBar` a la entrada y un DataFrame a la salida.
+
+### 4.6. Capa de datasets — `src/datasets/`
+
+Combina las features ya calculadas con el label (variable objetivo) para producir la tabla final que consume un modelo. A diferencia de `providers/` o `database/`, no es contrato abstracto + implementación: es un orquestador concreto (mismo patrón que `DataManager` o `MarketDataSyncService`), porque el proyecto solo necesita un tipo de label (retorno futuro) — no hay todavía una segunda implementación intercambiable que justifique una interfaz.
+
+- **`dataset_builder.py`** — `DatasetBuilder`: recibe un `FeatureCalculator` por inyección de dependencia. Su método `build(bars, timeframe, horizon)`:
+  1. Calcula las features con el `FeatureCalculator` inyectado.
+  2. Añade la columna `label`: el **log-retorno futuro** sobre el horizonte pedido, `ln(close[t + horizon] / close[t])`. Se eligió log-retorno (no retorno porcentual simple) por coherencia con las features `return_1`/`return_3`... que ya son log-retornos, por su propiedad aditiva entre horizontes y por tratar simétricamente subidas y bajadas.
+  3. Elimina filas incompletas: las iniciales sin ventana de lookback llena y las finales sin vela futura para calcular el label (recorte, no imputación).
+  4. Devuelve `(X, y)` ya separados: `X` excluye a propósito las columnas OHLCV crudas (precio y volumen absolutos) porque no son comparables entre instrumentos con escalas distintas (BTC ~60.000 vs. EUR/USD ~1.08) ni estacionarias en el tiempo — solo entran columnas relativas/normalizadas (indicadores, retornos, features temporales). `y` es la serie de labels alineada por índice con `X`.
+- El horizonte se expresa como `timedelta` (ej. `timedelta(hours=4)`), no como número de velas: `DatasetBuilder` lo convierte usando la nueva propiedad `TimeFrame.duration` (añadida en `src/domain/timeframe.py`), y valida que sea múltiplo exacto de la duración de una vela — pedir 30 minutos sobre velas de 1h falla explícitamente en vez de redondear en silencio. Así el horizonte es configurable sin tocar código y funciona igual para cualquier timeframe.
+
+**Para qué sirve:** cierra el pipeline `MarketBar → Features → (X, y)`. Es la pieza que entrega la tabla de entrenamiento; la siguiente capa (`training/`) ya no necesita saber nada de indicadores, velas ni horizontes — solo consume `X`/`y`.
+
+### 4.7. Tests — `tests/`
 
 Cada módulo de negocio tiene su suite de tests con `unittest` (librería estándar de Python, sin dependencias nuevas):
 
 - `tests/database/test_data_manager.py` — 7 tests: guardado/lectura, deduplicación, validaciones, aislamiento entre timeframes.
 - `tests/database/test_parquet_repository.py` — 10 tests: persistencia real en disco (usando carpetas temporales, nunca `data/` real), fusión entre escrituras sucesivas, normalización de símbolos, creación automática de carpetas, y una prueba de integración con `DataManager`.
 - `tests/sync/test_market_data_sync_service.py` — 6 tests: descarga inicial completa, reanudación incremental, fusión con lo ya guardado, skip cuando ya está al día, y validaciones. Usa un `FakeProvider` (un doble de test que cumple el contrato `BaseProvider`) para no depender de red real.
+- `tests/features/test_technical_indicators.py` — 11 tests: presencia de todas las columnas esperadas (incluidas las temporales), orden cronológico e índice UTC independientemente del orden de entrada, `NaN` cuando no hay bars suficientes para el lookback, verificación de valores calculados a mano para SMA, log-retorno y volumen relativo, codificación cíclica de hora/día-de-semana, y flags de sesión de mercado one-hot.
+- `tests/domain/test_timeframe.py` — 1 test: `TimeFrame.duration` devuelve la duración correcta para cada intervalo declarado.
+- `tests/datasets/test_dataset_builder.py` — 7 tests: validaciones de horizonte (positivo, múltiplo exacto de la duración de vela, bars no vacío), exclusión de columnas OHLCV/label crudas en `X`, `X`/`y` comparten índice y no tienen `NaN`, recorte de las filas finales sin label futuro, y verificación del label calculado a mano.
 
-Total: **23 tests**, todos en verde. Se ejecutan con:
+Total: **42 tests**, todos en verde. Se ejecutan con:
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-### 4.6. Dependencias — `requirements.txt`
+### 4.8. Dependencias — `requirements.txt`
 
 - `requests` — cliente HTTP usado por `BinanceProvider`.
 - `pandas` y `pyarrow` — manejo tabular y lectura/escritura de Parquet, usados únicamente dentro de `ParquetRepository`.
+- `pandas-ta-classic` — cálculo de indicadores técnicos, usado únicamente dentro de `TechnicalIndicatorCalculator`.
+- `numpy` — cálculo de log-retornos, usado únicamente dentro de `TechnicalIndicatorCalculator`.
 
 ---
 
@@ -147,11 +185,11 @@ Todo esto sigue el pipeline objetivo del proyecto:
 ```
 Provider → MarketBar → DataManager → Parquet Storage   ✅ HECHO
                                           ↓
-                                Feature Engineering      ⬜ SIGUIENTE
+                                Feature Engineering      ✅ HECHO
                                           ↓
-                                  Dataset Builder         ⬜
+                                  Dataset Builder         ✅ HECHO
                                           ↓
-                                      Training             ⬜
+                                      Training             ⬜ SIGUIENTE
                                           ↓
                                     Evaluation              ⬜
                                           ↓
@@ -160,21 +198,31 @@ Provider → MarketBar → DataManager → Parquet Storage   ✅ HECHO
                                     Application                 ⬜
 ```
 
-### 6.1. `src/features/` — Feature Engineering (SIGUIENTE PASO)
+### 6.1. `src/features/` — Feature Engineering (✅ HECHO)
 
-**Qué es:** a partir de las velas OHLCV crudas guardadas en Parquet, calcular variables (features) que un modelo de ML pueda usar para predecir: medias móviles, RSI, volatilidad, retornos pasados, volumen relativo, etc.
+**Qué es:** a partir de las velas OHLCV crudas guardadas en Parquet, calcula variables (features) que un modelo de ML pueda usar para predecir. Ver el detalle completo en [4.5](#45-capa-de-features--srcfeatures).
 
-**Por qué es el siguiente paso lógico:** ahora mismo `data/` puede llenarse de velas reales gracias al `MarketDataSyncService`, pero esas velas crudas no sirven directamente para entrenar un modelo — hace falta transformarlas en variables predictivas.
+**Qué se implementó:** `FeatureCalculator` (contrato abstracto) + `TechnicalIndicatorCalculator` (implementación sobre `pandas-ta-classic`) + `IndicatorConfig` (parámetros centralizados). Cubre tendencia (SMA, EMA, ADX), momentum (RSI, MACD, Stochastic, MFI), volatilidad (Bollinger, ATR), volumen (OBV, volumen relativo), retornos pasados y features temporales (hora del día y día de la semana cíclicos, sesión de mercado one-hot). 11 tests en `tests/features/test_technical_indicators.py`.
 
-**Diseño esperado (a validar cuando lleguemos):** funciones o clases "calculadoras de features" que reciban una serie de `MarketBar` (o el resultado de `DataManager.get_bars`) y devuelvan una tabla de features, sin conocer de dónde vinieron los datos ni cómo se van a usar después. Cada feature (media móvil, RSI...) como una unidad independiente y combinable, para poder experimentar añadiendo o quitando features sin reescribir todo.
+**Qué queda fuera deliberadamente (no bloqueante para seguir):**
 
-### 6.2. `src/datasets/` — Dataset Builder
+- **Manejo de los `NaN` iniciales** que dejan los indicadores mientras se llena su ventana de lookback: es responsabilidad de la siguiente capa (`datasets/`), que decide si recorta esas filas o las imputa al construir la tabla final `X`/`y`.
 
-**Qué es:** combina las features generadas con la variable objetivo (el **label**): el retorno porcentual futuro sobre un horizonte configurable (ej. "cuánto sube o baja el precio en las próximas 4 horas"). Aquí se construye la tabla final `X` (features) + `y` (target) que se le da a un modelo.
+### 6.2. `src/datasets/` — Dataset Builder (✅ HECHO)
 
-**Por qué importa:** el horizonte de predicción debe ser configurable (30 min, 1h, 4h, 24h...) sin tocar código — es un requisito explícito del proyecto. También hay que evitar *data leakage* (que una feature use información del futuro sin querer).
+**Qué es:** combina las features generadas con la variable objetivo (el **label**): el log-retorno futuro sobre un horizonte configurable (ej. "cuánto sube o baja el precio en las próximas 4 horas"). Construye la tabla final `X` (features) + `y` (target) que se le da a un modelo. Ver el detalle completo en [4.6](#46-capa-de-datasets--srcdatasets).
 
-### 6.3. `src/training/` — Entrenamiento
+**Qué se implementó:** `DatasetBuilder` (orquestador concreto, sin contrato abstracto — solo hay un tipo de label por ahora) inyectado con un `FeatureCalculator`. El horizonte se pasa como `timedelta` y se convierte a número de velas vía la nueva `TimeFrame.duration`, validando que sea múltiplo exacto. `X` excluye las columnas OHLCV crudas por no ser comparables entre instrumentos; `y` es el label alineado por índice. Filas sin lookback completo o sin vela futura para el label se recortan. Validado contra el histórico completo de BTC/USDT en Binance (`data/crypto/BTCUSDT/1h.parquet`, 77.980 velas desde su listing en 2017-08-17 hasta hoy — ver el backfill de histórico descrito justo debajo): produce 77.777 filas limpias, sin `NaN`, con estadísticas de `y` razonables. 7 tests en `tests/datasets/test_dataset_builder.py` + 1 test en `tests/domain/test_timeframe.py`.
+
+**Backfill de histórico completo:** `scripts/sync_data.py` (vía `MarketDataSyncService`) solo avanza hacia adelante desde el último dato guardado — no sirve para rellenar historia anterior a la ya almacenada. Con solo 6 meses de histórico inicial, el dataset tenía poca variedad de regímenes de mercado para entrenar y validar de forma robusta. Se añadió `scripts/backfill_data.py`, que llama directamente a `BinanceProvider.get_historical_bars` + `DataManager.store_bars` (sin pasar por el servicio de sync, que está pensado para avanzar, no retroceder) para traer todo el histórico desde el listing de BTC/USDT en Binance (2017-08-17). Resultado: de 4.320 a 77.980 velas de 1h. Se detectaron 28 huecos menores (~128 horas de ~78.000, todos entre 2017-2020, downtime típico de exchange en sus primeros años) — no se corrigen porque `DataManager` v1 ya decidió deliberadamente no implementar relleno de gaps por no hacer falta, y el volumen es insignificante.
+
+**Segundo timeframe — 15 minutos:** el objetivo del proyecto incluye explícitamente predecir sobre un horizonte de 30 minutos (ver [sección 1](#1-qué-es-market-predictor)), pero `DatasetBuilder` exige que el horizonte sea múltiplo exacto de la duración de la vela — imposible con solo velas de 1h. `scripts/sync_data.py` y `scripts/backfill_data.py` ahora iteran sobre una tupla `TIMEFRAMES` en vez de un único `TimeFrame`. Se añadió `TimeFrame.FIFTEEN_MINUTES` (divide exacto en 30 min): 312.063 velas (2017-08-17 → hoy), huecos igual de insignificantes (33 filas, ~565 slots de 15 min sobre 312.000). Validado: `DatasetBuilder.build(bars_15m, TimeFrame.FIFTEEN_MINUTES, timedelta(minutes=30))` ya no lanza error y produce 311.862 filas limpias.
+
+**Timeframes adicionales — 4 horas y 1 día:** distinto motivo al de 15m. Los horizontes de 4h/24h ya se pueden calcular sobre velas de 1h (4 y 24 velas respectivamente) — no hacían falta velas nativas de 4h/1d para eso. La razón real para tenerlas es otra: un indicador calculado sobre velas diarias nativas (ej. RSI diario) mide tendencia macro, información distinta a la del mismo indicador sobre velas de 1h — útil para features multi-timeframe en el futuro (tendencia macro + entrada a corto plazo). No se ha construido esa capa de features todavía (sería sobre-diseñar sin haber entrenado antes un modelo base que muestre que hace falta), pero descargar las velas en sí es barato, así que se hizo ya para no depender de red más adelante: 19.524 velas de 4h y 3.257 de 1d.
+
+**Qué queda fuera deliberadamente (no bloqueante para seguir):** un solo horizonte por llamada a `build()` — si en el futuro se quiere entrenar sobre varios horizontes a la vez, se llama a `build()` una vez por horizonte; no se ha añadido soporte multi-horizonte porque no hay evidencia todavía de que haga falta.
+
+### 6.3. `src/training/` — Entrenamiento (SIGUIENTE PASO)
 
 **Qué es:** el módulo que entrena modelos de ML sobre los datasets construidos. Debe soportar múltiples algoritmos intercambiables (Random Forest, XGBoost, LightGBM, CatBoost, LSTM, Transformers) sin que ninguno esté hardcodeado — es decir, otro patrón de contrato abstracto + implementaciones concretas, igual que `BaseProvider` o `BarRepository`.
 
@@ -232,8 +280,8 @@ Para quien continúe el proyecto, estas son las convenciones que se han seguido 
 | `database/ParquetRepository` | Cumple ese contrato en archivos Parquet reales, en disco. |
 | `database/DataManager` | Decide qué guardar y cómo (dedup, orden), sin saber cómo se persiste físicamente. |
 | `sync/MarketDataSyncService` | Conecta un provider con el DataManager: descarga solo lo que falta. |
-| `features/` (pendiente) | Convierte velas crudas en variables predictivas para el modelo. |
-| `datasets/` (pendiente) | Combina features + retorno futuro (target) en la tabla de entrenamiento. |
+| `features/TechnicalIndicatorCalculator` | Convierte velas crudas en variables predictivas: tendencia, momentum, volatilidad, volumen, retornos y temporales (hora/día/sesión). |
+| `datasets/DatasetBuilder` | Combina features + log-retorno futuro (target) en la tabla `X`/`y` de entrenamiento. |
 | `training/` (pendiente) | Entrena modelos intercambiables sobre esa tabla. |
 | `evaluation/` (pendiente) | Mide qué tan buenos son esos modelos. |
 | `prediction/` (pendiente) | Sirve predicciones con un modelo ya entrenado. |
@@ -243,4 +291,4 @@ Para quien continúe el proyecto, estas son las convenciones que se han seguido 
 
 ## 9. Próximo paso inmediato
 
-Construir **`src/features/`**: el módulo de feature engineering que transforma las velas OHLCV crudas (ya persistibles gracias a todo lo construido hasta ahora) en variables numéricas listas para alimentar un modelo de Machine Learning. Antes de escribir código, hay que decidir y explicar: qué features se calculan primero (medias móviles, retornos, volatilidad...), cómo se representan (una clase por feature vs. funciones puras), y cómo se combinan sin acoplarse a un dataset o modelo concreto.
+Construir **`src/training/`**: el módulo de entrenamiento que consume la tabla `X`/`y` producida por `DatasetBuilder` y entrena modelos de ML intercambiables (Random Forest, XGBoost, LightGBM, CatBoost, LSTM, Transformers...) sin que ninguno esté hardcodeado en el pipeline. Antes de escribir código, hay que decidir y explicar: el contrato abstracto (`ModelTrainer` o similar) que deben cumplir todas las implementaciones, cómo se hace el split train/validation/test respetando el orden temporal (nunca aleatorio, para no filtrar información futura), y con qué modelo concreto se empieza como primera implementación de referencia.

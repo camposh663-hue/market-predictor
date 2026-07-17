@@ -16,7 +16,12 @@ from src.sync import MarketDataSyncService
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 HISTORY = timedelta(days=180)
 INSTRUMENT = Instrument(symbol="BTC/USDT", asset_class=AssetClass.CRYPTO)
-TIMEFRAME = TimeFrame.ONE_HOUR
+TIMEFRAMES = (
+    TimeFrame.ONE_HOUR,
+    TimeFrame.FIFTEEN_MINUTES,
+    TimeFrame.FOUR_HOURS,
+    TimeFrame.ONE_DAY,
+)
 
 
 def main() -> None:
@@ -28,11 +33,11 @@ def main() -> None:
     end = datetime.now(timezone.utc)
     start = end - HISTORY
 
-    fetched = sync_service.sync_bars(INSTRUMENT, TIMEFRAME, start, end)
-    latest = data_manager.latest_timestamp(INSTRUMENT, TIMEFRAME)
-
-    print(f"Fetched {len(fetched)} new bars for {INSTRUMENT.symbol} ({TIMEFRAME.value}).")
-    print(f"Latest stored bar: {latest}")
+    for timeframe in TIMEFRAMES:
+        fetched = sync_service.sync_bars(INSTRUMENT, timeframe, start, end)
+        latest = data_manager.latest_timestamp(INSTRUMENT, timeframe)
+        print(f"Fetched {len(fetched)} new bars for {INSTRUMENT.symbol} ({timeframe.value}).")
+        print(f"Latest stored bar: {latest}")
 
 
 if __name__ == "__main__":
