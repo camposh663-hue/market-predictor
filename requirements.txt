@@ -13,3 +13,13 @@ numpy>=1.26.0,<3.0.0
 # imports `numpy.NaN`, removed in numpy>=2.0, and is unavailable for this
 # Python version.
 pandas-ta-classic>=0.6.0
+
+# Baseline model and evaluation metrics used by RandomForestTrainer.
+# joblib is a scikit-learn dependency; listed explicitly because
+# scripts/train_model.py imports it directly to persist trained models.
+scikit-learn>=1.3.0,<2.0.0
+joblib>=1.3.0
+
+# Gradient-boosted trees used by XGBoostTrainer, the second interchangeable
+# ModelTrainer implementation compared against RandomForestTrainer.
+xgboost>=2.0.0,<3.0.0

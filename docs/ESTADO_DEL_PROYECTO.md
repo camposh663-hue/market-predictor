@@ -140,8 +140,15 @@ Cada módulo de negocio tiene su suite de tests con `unittest` (librería están
 - `tests/features/test_technical_indicators.py` — 11 tests: presencia de todas las columnas esperadas (incluidas las temporales), orden cronológico e índice UTC independientemente del orden de entrada, `NaN` cuando no hay bars suficientes para el lookback, verificación de valores calculados a mano para SMA, log-retorno y volumen relativo, codificación cíclica de hora/día-de-semana, y flags de sesión de mercado one-hot.
 - `tests/domain/test_timeframe.py` — 1 test: `TimeFrame.duration` devuelve la duración correcta para cada intervalo declarado.
 - `tests/datasets/test_dataset_builder.py` — 7 tests: validaciones de horizonte (positivo, múltiplo exacto de la duración de vela, bars no vacío), exclusión de columnas OHLCV/label crudas en `X`, `X`/`y` comparten índice y no tienen `NaN`, recorte de las filas finales sin label futuro, y verificación del label calculado a mano.
+- `tests/training/test_time_series_split.py` — 11 tests: validaciones del constructor (`n_splits`, `embargo`, `test_size`), `test_split` reserva la fracción final y purga el embargo, `split` genera exactamente `n_splits` folds con ventana de entrenamiento creciente, nunca mezcla futuro antes que pasado, respeta el hueco de embargo, y lanza error cuando no hay filas suficientes.
+- `tests/training/test_metrics.py` — 6 tests: `directional_accuracy` con acierto total, fallo total, acierto parcial, predicción cero (nunca cuenta como acierto), y validaciones de índice/vacío.
+- `tests/training/test_random_forest_trainer.py` — 7 tests: `model_id`, error si se predice o se piden `feature_importances` antes de `fit`, validaciones de `fit` (vacío, índice no alineado), predicciones indexadas igual que la entrada, e importancias ordenadas de mayor a menor.
+- `tests/training/test_walk_forward_evaluator.py` — 6 tests: usa un `_FakeTrainer` (doble de test, mismo patrón que `FakeProvider`) para verificar que se pide un modelo nuevo por fold, que los tamaños de fold coinciden con el splitter, y que las métricas coinciden con lo calculado a mano; más una prueba de integración con `RandomForestTrainer` real sobre una señal sintética aprendible.
+- `tests/training/test_xgboost_trainer.py` — 7 tests: mismas validaciones que `RandomForestTrainer` (id, errores antes de `fit`, índice alineado, importancias ordenadas), sobre `XGBoostTrainer`.
+- `tests/evaluation/test_model_registry.py` — 2 tests: `hyperparameter_combinations` cubre el grid completo sin duplicados por modelo, y las factories producen el `model_id` esperado.
+- `tests/evaluation/test_experiment_runner.py` — 5 tests: un resultado por configuración, orden de mejor a peor por accuracy direccional media (desempate por desviación), error si falta el timeframe pedido en `bars_by_timeframe`, `evaluate_holdout` exige una corrida previa, y devuelve modelo entrenado + métricas de holdout coherentes.
 
-Total: **42 tests**, todos en verde. Se ejecutan con:
+Total: **86 tests**, todos en verde. Se ejecutan con:
 
 ```bash
 python -m unittest discover -s tests -v
@@ -153,6 +160,78 @@ python -m unittest discover -s tests -v
 - `pandas` y `pyarrow` — manejo tabular y lectura/escritura de Parquet, usados únicamente dentro de `ParquetRepository`.
 - `pandas-ta-classic` — cálculo de indicadores técnicos, usado únicamente dentro de `TechnicalIndicatorCalculator`.
 - `numpy` — cálculo de log-retornos, usado únicamente dentro de `TechnicalIndicatorCalculator`.
+- `scikit-learn` — `RandomForestTrainer`, métricas de error (MAE, RMSE) y `ParameterGrid` para los barridos de hiperparámetros, usado dentro de `src/training/` y `src/evaluation/`.
+- `joblib` — persistencia del modelo entrenado a disco (`scripts/train_model.py`, `scripts/run_experiments.py`). Dependencia transitiva de scikit-learn, listada explícitamente porque se importa directamente.
+- `xgboost` — `XGBoostTrainer`, segunda implementación de `ModelTrainer` sobre gradient boosting.
+
+### 4.9. Capa de training — `src/training/`
+
+Entrena y valida modelos de ML sobre la tabla `(X, y)` que entrega `DatasetBuilder`. Es la primera capa de la arquitectura con **dos** patrones de contrato abstracto + implementación conviviendo en el mismo módulo: uno para el modelo en sí (`ModelTrainer`), y otro, más simple, de orquestador concreto para la validación (`WalkForwardEvaluator`), mismo patrón que `DatasetBuilder` o `MarketDataSyncService`.
+
+- **`base_trainer.py`** — `ModelTrainer`: contrato abstracto. Define `model_id` (identificador estable, ej. `"random_forest"`), `fit(X, y)` y `predict(X) -> pd.Series`. Cualquier algoritmo futuro (XGBoost, LightGBM, LSTM...) solo necesita cumplir este contrato para ser intercambiable, sin tocar la validación ni los scripts que lo usan.
+- **`random_forest_trainer.py`** — `RandomForestTrainer`: primera implementación concreta, sobre `sklearn.ensemble.RandomForestRegressor`. Elegido como baseline sobre XGBoost/LightGBM o redes recurrentes/Transformers por varias razones: no necesita escalar features, tolera bien la multicolinealidad residual que aún queda entre indicadores, y expone `feature_importances_` — clave para verificar rápidamente si los indicadores aportan señal real antes de invertir en arquitecturas más complejas y más difíciles de depurar. Expone además una propiedad `feature_importances` (Serie ordenada de mayor a menor) para esa inspección. En la práctica resultó ser el más lento de los dos modelos con diferencia (sklearn no usa histogramas como XGBoost) — varios minutos por fit en el dataset de 15 minutos (~312.000 filas) frente a segundos de XGBoost para un ajuste comparable.
+- **`xgboost_trainer.py`** — `XGBoostTrainer`: segunda implementación concreta, sobre `xgboost.XGBRegressor` (gradient boosting: árboles secuenciales que corrigen el error de los anteriores, en vez de árboles independientes promediados como Random Forest). Mismo contrato, mismos métodos (`model_id`, `fit`, `predict`, `feature_importances`) — intercambiable sin tocar el resto del pipeline. En la búsqueda comparativa (ver [4.10](#410-capa-de-evaluation--srcevaluation)) ganó sistemáticamente a Random Forest, tanto en accuracy direccional como en velocidad de entrenamiento.
+- **`time_series_split.py`** — `PurgedWalkForwardSplit`: divisor cronológico **estricto**, sin mezcla aleatoria. Dos garantías independientes:
+  - `test_split(index)`: reserva el tramo final (`test_size`, ej. 15%) como **holdout** definitivo, purgado con un `embargo`. Este tramo solo se evalúa una vez, al final de todo.
+  - `split(index)`: genera `n_splits` folds *walk-forward* de ventana expansiva (entrena con `[0:k]`, valida justo después de un hueco de `embargo`, repite avanzando `k`), sobre el resto de los datos ("dev").
+
+  El **embargo** existe porque el label de `DatasetBuilder` mira hacia el futuro (`horizon` velas por delante): sin un hueco purgado en cada frontera train/validación, las últimas filas de entrenamiento podrían tener un label calculado con un precio que cae dentro de la ventana de validación — fuga de información sutil que un split cronológico "ingenuo" no evita. El embargo se pasa en número de velas (igual a `horizon // timeframe.duration`).
+- **`metrics.py`** — `directional_accuracy(y_true, y_pred)`: única métrica no cubierta por scikit-learn (MAE/RMSE se reutilizan directamente de `sklearn.metrics`, sin reimplementar). Mide qué fracción de las predicciones acierta el signo (sube/baja) — la métrica que de verdad importa para una señal de trading, más que el error absoluto.
+- **`walk_forward_evaluator.py`** — `WalkForwardEvaluator`: orquestador concreto (sin contrato abstracto — solo hay una forma de correr la validación por ahora) inyectado con un `PurgedWalkForwardSplit` y una *factory* de `ModelTrainer`. Por cada fold pide un modelo **nuevo y sin entrenar** a la factory — reutilizar el mismo modelo entre folds reintroduciría la fuga que el splitter existe para evitar. Devuelve una lista de `FoldResult` (tamaño de train/val, MAE, RMSE, directional accuracy) por fold, para ver el rendimiento por régimen de mercado en vez de un único número agregado.
+
+**Para qué sirve:** cierra el pipeline `(X, y) → Modelo entrenado y validado`. La capa de evaluación (ver [4.10](#410-capa-de-evaluation--srcevaluation)) construye reportes y comparaciones formales entre modelos sobre esta base; esta capa ya deja la validación *estricta* resuelta (nunca aleatoria, con embargo, con holdout final intacto), no solo el entrenamiento.
+
+**Primer experimento — BTC/USDT 1h, horizonte 4h:** `scripts/train_model.py` corre el pipeline completo sobre el histórico completo de BTC/USDT (77.777 filas limpias). Split: 15% final reservado como test (2025-03-16 → 2026-07-15, nunca visto durante la validación), embargo de 4 velas (= horizonte), 5 folds walk-forward sobre el 85% restante ("dev", 2017-08-25 → 2025-03-16).
+
+**Resultado:** *directional accuracy* del **48.4%–50.3%** en los 5 folds (media 49.2%, std 0.7%) y **48.4%** en el test final — es decir, **no mejor que lanzar una moneda al aire**, y de hecho ligeramente por debajo en la mayoría de los folds. MAE/RMSE (0.006–0.019 en log-retorno) están en línea con la volatilidad típica de BTC/USDT a 4h, no son anormales. Las features más importantes según el modelo (`bb_bandwidth`, `return_10`, `sma_200_dist`, `return_5`, `ema_12_dist`...) son razonables, pero no se traducen en poder predictivo direccional.
+
+**Qué significa esto:** no es un bug ni un error de implementación — es exactamente lo que la validación estricta está diseñada para revelar de forma honesta. Confirma, con un modelo real y validación rigurosa, la señal débil que ya había aparecido en la EDA inicial sobre correlaciones feature→target (ver también la nota de multicolinealidad en [4.5](#45-capa-de-features--srcfeatures)): los indicadores técnicos clásicos por sí solos, sobre BTC/USDT a 4h, no bastan para predecir la dirección mejor que el azar con un Random Forest. Es un resultado de baseline legítimo, no el final del camino.
+
+**Qué queda fuera deliberadamente (no bloqueante para seguir):** un solo horizonte por `ModelTrainer` a la vez — probar varios horizontes simultáneamente en una sola llamada no se soportó porque `DatasetBuilder.build()` ya obliga a un horizonte por invocación (ver [4.6](#46-capa-de-datasets--srcdatasets)); el barrido de horizontes se resuelve en la capa de evaluación ([4.10](#410-capa-de-evaluation--srcevaluation)) llamando a `build()` una vez por combinación.
+
+### 4.10. Capa de evaluation — `src/evaluation/`
+
+Compara sistemáticamente combinaciones de modelo, hiperparámetros, timeframe y horizonte, sin comprometer la validación estricta de `src/training/`: toda la búsqueda ocurre **solo** contra los folds walk-forward del dev set; el holdout de cada dataset se evalúa una única vez, para la configuración ganadora, al final de todo. Probar muchas configuraciones y quedarse con la que mejor puntúe contra el mismo test set reintroduciría en silencio el mismo sesgo de *data snooping* que el split purgado existe para evitar — separar "buscar" de "confirmar" es lo que mantiene la búsqueda amplia honesta.
+
+- **`experiment.py`** — `ExperimentConfig` (un punto del grid: `model_name`, `timeframe`, `horizon`, `hyperparams`) y `ExperimentResult` (media/desviación de directional accuracy y de MAE/RMSE a través de los folds de dev para ese punto). Nunca contienen información del holdout.
+- **`model_registry.py`** — `TRAINER_FACTORIES` (nombre de modelo → función que construye un `ModelTrainer`) y `HYPERPARAMETER_GRIDS` (qué combinaciones probar por modelo). Los grids se mantuvieron pequeños a propósito (4 combinaciones por modelo: 2 valores de nº de árboles × 2 de profundidad) — el objetivo era ver si cambiar la profundidad o el número de árboles alteraba el panorama, no exprimir una décima de mejora con una búsqueda densa.
+- **`experiment_runner.py`** — `ExperimentRunner`: orquestador concreto (mismo patrón que `DatasetBuilder`/`WalkForwardEvaluator` — sin contrato abstracto, solo hay una forma de correr la búsqueda). Construye y cachea un `Dataset` (X/y de dev y de holdout, más el splitter) por cada combinación distinta de `(timeframe, horizon)`, para no recalcular features de más entre hiperparámetros que comparten dataset. `run(configs, bars_by_timeframe)` evalúa cada configuración contra sus folds de dev y devuelve los resultados ordenados de mejor a peor (por accuracy direccional media, desempatando por menor desviación entre folds — se prefiere un resultado algo peor pero más estable a uno mejor pero errático). `evaluate_holdout(config)` solo se llama una vez, sobre la configuración ganadora ya elegida, y devuelve el modelo entrenado con todo el dev y sus métricas de holdout.
+
+**Para qué sirve:** cierra la pregunta "¿qué configuración es mejor, y de verdad, no por suerte de la búsqueda?" — sin esta capa, comparar 32 configuraciones a mano una por una (como se hizo para el primer baseline) no escala y tienta a mirar el holdout más de una vez.
+
+**Búsqueda completa — BTC/USDT, 2 modelos × 4 hiperparámetros × 4 combinaciones timeframe/horizonte:** `scripts/run_experiments.py` corrió las 32 configuraciones sobre el histórico completo (`15m→30min`, `1h→4h`, `4h→24h`, `1d→3 días`), 5 folds walk-forward cada una, guardando el ranking completo en `reports/experiment_results.csv`.
+
+**Resultado:**
+
+| Timeframe→Horizonte | Mejor accuracy direccional (dev) | Notas |
+|---|---|---|
+| 15m → 30min | **51.6%** (XGBoost, depth=3, n=200) | Mejor combinación con diferencia; std bajo (0.85%) entre folds |
+| 1h → 4h | 51.0% (XGBoost) | Random Forest se quedó en ~49% en este mismo horizonte |
+| 4h → 24h | 49.0% (XGBoost) | Random Forest cayó a 47.6-48.0% — peor que el azar |
+| 1d → 3 días | 51.2% (Random Forest) | Solo 3.257 filas; std hasta 2.7% entre folds — poco fiable |
+
+Ganador: **XGBoost, timeframe 15 minutos, horizonte 30 minutos, `max_depth=3, n_estimators=200`**. Holdout (evaluado una sola vez): **directional accuracy 51.8%**, mae=0.00212, rmse=0.00325 — consistente con el 51.6% visto en dev, señal de que la mejora no es pura casualidad de la búsqueda. Modelo persistido en `models/best_xgboost_15m_03000.joblib`.
+
+**Qué significa esto:** XGBoost bate sistemáticamente a Random Forest, y los horizontes cortos (15m→30min, 1h→4h) muestran más señal que los largos (4h→24h fue peor que el azar). La mejora sobre el 50% (~1.5-2 puntos porcentuales) es consistente entre dev y holdout, pero sigue siendo pequeña — con 32 configuraciones probadas, parte de esa mejora podría deberse a suerte de la búsqueda (*multiple comparisons*); el holdout ayuda a descartar que sea *solo* eso, pero no lo garantiza al 100%. No es una señal lo bastante fuerte para operar con ella sin más — es un indicio real, no una estrategia.
+
+**Qué queda fuera deliberadamente (no bloqueante para seguir):** grids de hiperparámetros pequeños (4 por modelo) — una búsqueda más densa (learning rate, subsample, regularización...) se pospone porque con una señal tan débil, afinar hiperparámetros probablemente mida ruido con más precisión antes que crear señal donde no la hay. Tampoco se corrigió la significancia estadística de forma rigurosa (ej. bootstrap sobre los folds, corrección por comparaciones múltiples) — el holdout de un solo uso es la salvaguarda actual, no una prueba formal.
+
+**Modelos guardados por combinación:** `scripts/run_experiments.py` ahora persiste el ganador de **cada** combinación timeframe/horizonte (no solo el ganador global), en `models/best_{modelo}_{timeframe}_{horizonte}.joblib`. Al re-evaluar los 4 contra su propio holdout se detectó algo importante: el de `1d→3 días`, que en dev parecía competitivo (51.2%), **cae a 47.6% en su holdout** — por debajo del azar. Confirma que ese resultado era ruido de un dataset pequeño (3.257 filas), no señal real; los otros tres (15m, 1h, 4h) se mantienen razonablemente estables entre dev y holdout.
+
+**Backtest con costes reales — `backtest.py`:** antes de construir `src/prediction/`, se añadió `directional_backtest(y_true, y_pred, cost_per_trade)`: simula una regla de trading fija (posición larga/corta según el signo de la predicción, una operación de ida y vuelta por fila, sin posiciones solapadas — un backtest vectorizado de primera pasada, no un simulador de cartera) y resta un coste por operación. La regla y el coste se fijaron **antes** de mirar el resultado, precisamente para no repetir el problema de *data snooping* que la búsqueda de hiperparámetros ya evitó — probar varios umbrales o costes hasta encontrar uno favorable reintroducría el mismo sesgo. 7 tests en `tests/evaluation/test_backtest.py`.
+
+**Resultado (`scripts/backtest_costs.py`, comisión estándar de Binance Spot: 0.1% por ejecución × 2 = 0.2% ida y vuelta, sin descuento por BNB ni volumen):**
+
+| Timeframe→Horizonte | Nº operaciones | Bruto | Neto | Win rate neto |
+|---|---|---|---|---|
+| 15m→30min | 46.779 | +407.8% | **-8.948%** | 19.2% |
+| 1h→4h | 11.666 | -31.7% | -236.5% | 35.7% |
+| 4h→24h | 2.897 | -48.4% | -627.8% | 44.8% |
+| 1d→3 días | 458 | -164.4% | -256.0% | 43.9% |
+
+**Qué significa esto:** los cuatro pierden dinero neto sobre su holdout. El caso más claro es 15m→30min: la ventaja media por operación era de **0.87 puntos básicos** en bruto, frente a un coste de **20 puntos básicos** por operación — el coste es ~23 veces mayor que el edge. Operar en cada vela de 15 minutos con un edge de ese tamaño nunca puede superar comisiones estándar, sin importar cuánto se afine el modelo. Esto confirma, con datos, que **no conviene construir `src/prediction/` sobre estos modelos tal cual** — sería servir una estrategia que pierde dinero por diseño, no por error de implementación.
+
+**Qué queda fuera deliberadamente (no bloqueante para seguir):** filtrar operaciones por confianza (solo operar cuando `|predicción|` supera un umbral, para reducir frecuencia y quedarse con las señales más fuertes) no se probó aquí — hacerlo sobre el mismo holdout ya usado reintroduciría exactamente el sesgo que se ha evitado todo este tiempo. Si se persigue esa idea, el umbral debe elegirse con los folds de dev (nunca con el holdout) y confirmarse una sola vez, igual que el resto de decisiones de este documento.
 
 ---
 
@@ -189,9 +268,9 @@ Provider → MarketBar → DataManager → Parquet Storage   ✅ HECHO
                                           ↓
                                   Dataset Builder         ✅ HECHO
                                           ↓
-                                      Training             ⬜ SIGUIENTE
+                                      Training             ✅ HECHO (RandomForest + XGBoost)
                                           ↓
-                                    Evaluation              ⬜
+                                    Evaluation              ✅ HECHO (búsqueda exhaustiva: ~51.6% dev / 51.8% holdout)
                                           ↓
                                     Prediction                ⬜
                                           ↓
@@ -222,15 +301,21 @@ Provider → MarketBar → DataManager → Parquet Storage   ✅ HECHO
 
 **Qué queda fuera deliberadamente (no bloqueante para seguir):** un solo horizonte por llamada a `build()` — si en el futuro se quiere entrenar sobre varios horizontes a la vez, se llama a `build()` una vez por horizonte; no se ha añadido soporte multi-horizonte porque no hay evidencia todavía de que haga falta.
 
-### 6.3. `src/training/` — Entrenamiento (SIGUIENTE PASO)
+### 6.3. `src/training/` — Entrenamiento (✅ HECHO)
 
-**Qué es:** el módulo que entrena modelos de ML sobre los datasets construidos. Debe soportar múltiples algoritmos intercambiables (Random Forest, XGBoost, LightGBM, CatBoost, LSTM, Transformers) sin que ninguno esté hardcodeado — es decir, otro patrón de contrato abstracto + implementaciones concretas, igual que `BaseProvider` o `BarRepository`.
+**Qué es:** el módulo que entrena modelos de ML sobre los datasets construidos, con validación cronológica estricta (walk-forward purgado con embargo, holdout final intacto). Ver el detalle completo en [4.9](#49-capa-de-training--srctraining).
 
-**Por qué importa:** el objetivo del proyecto es poder comparar algoritmos fácilmente. Esto solo funciona si entrenar un modelo nuevo es "cambiar una pieza", no reescribir el pipeline.
+**Qué se implementó:** `ModelTrainer` (contrato abstracto: `model_id`, `fit`, `predict`) + `RandomForestTrainer` y `XGBoostTrainer` (dos implementaciones) + `PurgedWalkForwardSplit` (split cronológico con embargo y holdout) + `WalkForwardEvaluator` (orquestador de la validación por folds) + `directional_accuracy` (única métrica no cubierta por scikit-learn). 37 tests nuevos en `tests/training/`. Primer experimento (baseline, Random Forest, BTC/USDT 1h/horizonte 4h): *directional accuracy* ~49% (no mejor que el azar) — resultado honesto que motivó la búsqueda más amplia en [4.10](#410-capa-de-evaluation--srcevaluation).
 
-### 6.4. `src/evaluation/` — Evaluación
+**Qué queda fuera deliberadamente (no bloqueante para seguir):** LightGBM, CatBoost, LSTM o Transformers como terceras/cuartas implementaciones de `ModelTrainer` — se añadirían si la búsqueda de la sección 6.4 mostrara que la familia de árboles (RF/XGBoost) tiene un techo claro que otro tipo de modelo pudiera superar; de momento ambos modelos de árboles llegan a resultados similares entre sí, así que no hay evidencia de que sea ese el cuello de botella.
 
-**Qué es:** mide qué tan bien predicen los modelos entrenados: métricas de error (MAE, RMSE), métricas específicas de series temporales financieras (ej. accuracy direccional: ¿acertó si subía o bajaba?), y validación respetando el orden temporal (nunca mezclar aleatoriamente pasado y futuro al validar, porque en series de tiempo eso "hace trampa").
+### 6.4. `src/evaluation/` — Evaluación (✅ HECHO)
+
+**Qué es:** capa que compara sistemáticamente combinaciones de modelo, hiperparámetros, timeframe y horizonte contra los folds de dev, y evalúa la configuración ganadora una única vez contra su holdout. Ver el detalle completo, resultados y tabla comparativa en [4.10](#410-capa-de-evaluation--srcevaluation).
+
+**Qué se implementó:** `ExperimentConfig`/`ExperimentResult` (un punto del grid y su resultado en dev) + `model_registry.py` (qué modelos/hiperparámetros probar) + `ExperimentRunner` (corre y cachea datasets por timeframe/horizonte, nunca toca el holdout salvo para la configuración ganadora). 7 tests nuevos en `tests/evaluation/`. Búsqueda completa corrida vía `scripts/run_experiments.py`: 32 configuraciones (2 modelos × 4 hiperparámetros × 4 combinaciones timeframe/horizonte). Ganador: XGBoost a 15m→30min, **51.6% dev / 51.8% holdout** — mejora modesta pero consistente sobre el baseline inicial (~49%) y sobre el azar (50%).
+
+**Qué queda fuera deliberadamente (no bloqueante para seguir):** métricas específicas de estrategia (ej. Sharpe ratio de una simulación de trading con costes de transacción, calibración de la magnitud predicha más allá del signo) y corrección estadística formal por comparaciones múltiples (ej. bootstrap sobre los folds) — se añadirían si se decide perseguir esta señal como estrategia real; de momento el holdout de un solo uso es la salvaguarda contra el sobreajuste a la búsqueda, no una prueba de significancia formal.
 
 ### 6.5. `src/prediction/` — Servicio de predicción
 
@@ -282,8 +367,11 @@ Para quien continúe el proyecto, estas son las convenciones que se han seguido 
 | `sync/MarketDataSyncService` | Conecta un provider con el DataManager: descarga solo lo que falta. |
 | `features/TechnicalIndicatorCalculator` | Convierte velas crudas en variables predictivas: tendencia, momentum, volatilidad, volumen, retornos y temporales (hora/día/sesión). |
 | `datasets/DatasetBuilder` | Combina features + log-retorno futuro (target) en la tabla `X`/`y` de entrenamiento. |
-| `training/` (pendiente) | Entrena modelos intercambiables sobre esa tabla. |
-| `evaluation/` (pendiente) | Mide qué tan buenos son esos modelos. |
+| `training/ModelTrainer` | El contrato: "así se entrena y predice con cualquier modelo intercambiable". |
+| `training/RandomForestTrainer` / `XGBoostTrainer` | Cumplen ese contrato — bagging vs. gradient boosting. XGBoost gana sistemáticamente. |
+| `training/PurgedWalkForwardSplit` | Split cronológico estricto: walk-forward con embargo y holdout final, sin mezclar nunca pasado y futuro. |
+| `training/WalkForwardEvaluator` | Entrena y mide un modelo nuevo por fold, sin fugas entre ellos. |
+| `evaluation/ExperimentRunner` | Busca sistemáticamente modelo × hiperparámetros × timeframe/horizonte, solo contra dev; el holdout se mira una vez. |
 | `prediction/` (pendiente) | Sirve predicciones con un modelo ya entrenado. |
 | `app/` (pendiente) | Expone todo esto a un usuario final. |
 
@@ -291,4 +379,9 @@ Para quien continúe el proyecto, estas son las convenciones que se han seguido 
 
 ## 9. Próximo paso inmediato
 
-Construir **`src/training/`**: el módulo de entrenamiento que consume la tabla `X`/`y` producida por `DatasetBuilder` y entrena modelos de ML intercambiables (Random Forest, XGBoost, LightGBM, CatBoost, LSTM, Transformers...) sin que ninguno esté hardcodeado en el pipeline. Antes de escribir código, hay que decidir y explicar: el contrato abstracto (`ModelTrainer` o similar) que deben cumplir todas las implementaciones, cómo se hace el split train/validation/test respetando el orden temporal (nunca aleatorio, para no filtrar información futura), y con qué modelo concreto se empieza como primera implementación de referencia.
+La búsqueda exhaustiva (32 configuraciones, 2 modelos, 4 combinaciones timeframe/horizonte) ya corrió con validación estricta: ganador **XGBoost a 15m→30min, 51.6% dev / 51.8% holdout** — una mejora real pero modesta sobre el azar (ver [4.10](#410-capa-de-evaluation--srcevaluation)). Antes de construir **`src/prediction/`** (servir esto en producción), conviene responder dos preguntas que la búsqueda actual no responde:
+
+1. **¿La señal sobrevive a costes reales?** 51.8% de accuracy direccional a 30 minutos no dice nada sobre si es rentable una vez se descuentan comisión y spread de Binance — un backtest simple con costes de transacción (aunque sea aproximado, sin construir todavía la capa `evaluation/` de métricas de estrategia completa) es el filtro más barato antes de invertir en servir el modelo.
+2. **¿Es estadísticamente robusta o suerte de la búsqueda?** Se probaron 32 configuraciones; un bootstrap sobre los folds del ganador (o repetir con distintas semillas) daría más confianza en que el 51.6%-51.8% no es ruido con buena pinta.
+
+Si ambas resisten, entonces sí tiene sentido construir `src/prediction/` sobre el modelo ya guardado (`models/best_xgboost_15m_03000.joblib`). Si no, la palanca más prometedora sería revisar las features (multi-timeframe, usando las velas de 4h/1d ya descargadas) antes que seguir probando más modelos sobre las mismas 32 columnas actuales.
