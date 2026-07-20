@@ -112,6 +112,19 @@ class DatasetBuilderTests(unittest.TestCase):
         expected = math.log(closes[probe_hour + 2] / closes[probe_hour])
         self.assertAlmostEqual(y.loc[probe_timestamp], expected)
 
+    def test_custom_label_fn_overrides_the_default_log_return(self) -> None:
+        bars = _bars([100.0 + i for i in range(30)])
+        horizon = timedelta(hours=2)
+        constant_label_fn = lambda df, bars_per_horizon: df["close"] * 0 + 7.0  # noqa: E731
+        builder = DatasetBuilder(
+            feature_calculator=TechnicalIndicatorCalculator(config=_TINY_CONFIG),
+            label_fn=constant_label_fn,
+        )
+
+        _, y = builder.build(bars, TimeFrame.ONE_HOUR, horizon)
+
+        self.assertTrue((y == 7.0).all())
+
 
 if __name__ == "__main__":
     unittest.main()

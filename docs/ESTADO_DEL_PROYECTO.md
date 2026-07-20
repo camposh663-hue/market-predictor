@@ -233,6 +233,103 @@ Ganador: **XGBoost, timeframe 15 minutos, horizonte 30 minutos, `max_depth=3, n_
 
 **Qué queda fuera deliberadamente (no bloqueante para seguir):** filtrar operaciones por confianza (solo operar cuando `|predicción|` supera un umbral, para reducir frecuencia y quedarse con las señales más fuertes) no se probó aquí — hacerlo sobre el mismo holdout ya usado reintroduciría exactamente el sesgo que se ha evitado todo este tiempo. Si se persigue esa idea, el umbral debe elegirse con los folds de dev (nunca con el holdout) y confirmarse una sola vez, igual que el resto de decisiones de este documento.
 
+**Filtrado por confianza — resultado (`scripts/threshold_search.py`):** se probó justo esa idea sobre el ganador 15m→30min: elegir, solo con los folds de dev, qué fracción de las predicciones de mayor magnitud conviene operar (`1.0, 0.5, 0.25, 0.1, 0.05`). Ni siquiera la fracción más agresiva (`0.05`, operar solo el 5% de mayor confianza) logró retorno neto positivo en dev. Confirmado una sola vez sobre el holdout con el umbral elegido: sigue en pérdidas. El edge del modelo es demasiado débil y demasiado disperso entre operaciones para que concentrarse en las "mejores" señales lo vuelva rentable — no es un problema de frecuencia de operación, es que el propio modelo no separa bien ganadoras de perdedoras ni siquiera en su cola de mayor confianza.
+
+### 4.11. Contexto multi-timeframe — intento y resultado
+
+**Qué es:** `MultiTimeframeFeatureCalculator` (`src/features/multi_timeframe_feature_calculator.py`), la palanca identificada como "próximo paso" tras ver que ni el modelo base ni el filtrado por confianza bastaban: añadir al dataset de 15m un RSI y una distancia a SMA larga calculados sobre velas de 4h y de 1d, como contexto de tendencia macro (ver [6.2](#62-srcdatasets--dataset-builder--hecho)). Envuelve un `FeatureCalculator` base (el de 15m) y, por cada timeframe de contexto configurado, calcula sus propios indicadores y los fusiona con `pd.merge_asof`, desplazados a su hora de cierre — una vela de 4h solo es conocible una vez cerrada, nunca en su apertura, para no filtrar información del futuro. 5 tests en `tests/features/test_multi_timeframe_feature_calculator.py`.
+
+**Búsqueda (`scripts/multi_timeframe_experiment.py`):** mismo modelo ganador (XGBoost, `max_depth=3, n_estimators=200`) y mismo par timeframe/horizonte (15m→30min), pero con el dataset ampliado a 36 columnas (las de siempre más `rsi_14_4h`, `sma_200_dist_4h`, `rsi_14_1d`, `sma_200_dist_1d`). Siguiendo la misma disciplina del resto del documento, el holdout solo se toca si el resultado en dev supera al baseline de una sola señal.
+
+**Resultado:**
+
+| | Dev (5 folds walk-forward) | Holdout |
+|---|---|---|
+| Solo 15m (baseline, [4.10](#410-capa-de-evaluation--srcevaluation)) | 51.6% | 51.8% |
+| 15m + contexto 4h/1d | **51.77%** (std 0.19%) | **51.88%** |
+
+La mejora (~0.15-0.2 puntos porcentuales) es real y consistente entre dev y holdout — no es ruido de una sola tirada — pero es demasiado pequeña para importar en la práctica. El filtrado por confianza repetido sobre este dataset ampliado (misma búsqueda de `keep_fraction` que en [4.10](#410-capa-de-evaluation--srcevaluation)) tampoco encuentra ningún umbral con retorno neto positivo en dev; incluso en el 5% de mayor confianza el retorno neto medio por operación sigue en -17.2 puntos básicos, frente a un coste de 20. En el holdout, con ese mismo umbral: 1.311 operaciones, retorno neto -18.1 puntos básicos por operación, -237% acumulado, win rate 33.3% (mejor que el 18.6% sin filtrar, pero lejos del ~55%+ que haría falta para cubrir el coste con este tamaño de edge).
+
+**Qué significa esto:** añadir contexto de timeframes superiores ayuda un poco — confirma que hay algo de información real en la tendencia macro que el modelo de 15m no veía — pero no cambia la conclusión de fondo. El problema no es que falten features de un tipo concreto (multi-timeframe, en este caso); es que los indicadores técnicos clásicos, solos o combinados entre escalas temporales, no producen un edge direccional lo bastante grande para un instrumento tan líquido y con comisiones estándar de Binance a granularidad de 15-30 minutos. Seguir iterando sobre este mismo tipo de features (más indicadores, más timeframes de contexto) tiene rendimientos decrecientes esperables, no una promesa de cruzar el umbral de rentabilidad.
+
+**Qué queda fuera deliberadamente (no bloqueante para seguir):** no se repitió esta búsqueda sobre los pares 1h→4h ni 4h→24h — el de 15m→30min ya tenía el edge más prometedor de los cuatro en el baseline, y el patrón de resultado (mejora pequeña, filtrado por confianza sigue sin ser rentable) no da motivo para esperar algo distinto en los demás. Tampoco se probaron más columnas de contexto por timeframe (solo RSI + tendencia larga, ver la clase) — añadir más aumentaría la dimensionalidad sin que haya evidencia de que el cuello de botella sea "pocas features" en vez de "las features clásicas no alcanzan".
+
+### 4.12. Funding rate de futuros perpetuos — intento y resultado
+
+**Qué es:** tras descartar tanto el filtrado por confianza como el contexto multi-timeframe, y comprobar que bajar comisión tampoco cierra la brecha ([9](#9-próximo-paso-inmediato)), se probó una fuente de información cualitativamente distinta: el *funding rate* de BTCUSDT perpetuo en Binance Futures — lo que pagan los largos a los cortos (o al revés) cada 8h, una señal real de presión de posicionamiento documentada en trading cuant, que no se deriva del precio spot como todos los indicadores usados hasta ahora.
+
+**Qué se implementó (piezas nuevas, mismo patrón contrato+implementación del resto del proyecto):** `FundingRate` (entidad de dominio) · `FundingRateProvider`/`BinanceFundingRateProvider` (descarga desde `fapi.binance.com/fapi/v1/fundingRate`) · `FundingRateRepository`/`ParquetFundingRateRepository` (persistencia en `data/crypto/BTCUSDT/funding_rate.parquet`, mismo árbol que los timeframes) · `FundingRateFeatureCalculator` (añade `funding_rate` y `funding_rate_cum_3` — suma de las últimas 3 liquidaciones, 24h acumuladas — fusionadas por `merge_asof`; a diferencia del contexto multi-timeframe, aquí no hace falta desplazar a "hora de cierre": el momento de liquidación ya es el instante en que el dato se conoce). 25 tests nuevos entre dominio, provider (con sesión HTTP falsa), repositorio y feature calculator. Backfill real ejecutado: 7.516 liquidaciones desde el lanzamiento del perpetuo (2019-09-10) hasta hoy.
+
+**Búsqueda (`scripts/funding_rate_experiment.py`):** mismo modelo ganador y mismo par 15m→30min, mismo gate que en 4.11 (no toca holdout si dev no supera 51.6%).
+
+**Resultado:** el gate **no se superó** — accuracy direccional en dev del **51.36%** (std 0.93%, notablemente más ruidosa entre folds que el 0.19% visto con contexto multi-timeframe), por debajo del baseline de una sola señal. El script paró ahí, sin tocar el holdout, tal como está diseñado.
+
+**Qué significa esto:** a diferencia del contexto multi-timeframe (que sí mejoraba dev aunque no bastara para ser rentable), el funding rate ni siquiera superó el baseline en este primer intento. Un matiz honesto a tener en cuenta antes de descartar la idea del todo: el histórico de funding rate solo llega hasta 2019-09-10 (lanzamiento del perpetuo), frente a los datos de precio que llegan hasta 2017 — el dataset resultante tiene 239.992 filas en vez de las ~312.000 habituales, un periodo más corto y con menos variedad de regímenes de mercado, lo que por sí solo podría explicar parte del peor resultado y de la mayor dispersión entre folds, independientemente de si el funding rate en sí aporta o no señal.
+
+**Qué queda fuera deliberadamente (no bloqueante para seguir):** no se repitió el experimento restringiendo el resto de features al mismo rango de fechas 2019-2026 para aislar si la caída se debe al feature o al periodo más corto — sería el siguiente paso natural si se quisiera insistir en esta vía en vez de pasar a la número 3 (replantear el objetivo).
+
+### 4.13. Predecir volatilidad en vez de dirección — Fase 1: ¿es predecible? (primer resultado positivo del proyecto)
+
+**Qué es:** tras agotar dos vías para mejorar la predicción de *dirección* (4.11, 4.12), se cambió de objetivo: en vez de predecir si el precio sube o baja, predecir **cuánto se va a mover** (volatilidad realizada futura, `sqrt(suma de retornos log al cuadrado sobre el horizonte)`), una magnitud siempre positiva que la literatura cuant respalda como más predecible que la dirección (clustering de volatilidad, la base de modelos GARCH). Antes de construir infraestructura de opciones (que necesitaría datos de Deribit — DVOL, su índice de volatilidad implícita a 30 días, gratuito y verificado como viable), esta Fase 1 comprobó barato si hay algo real que predecir, comparando un XGBoost contra una baseline ingenua de persistencia ("la volatilidad de la ventana pasada predice la de la ventana futura").
+
+**Qué se implementó:** `DatasetBuilder` ahora acepta un `label_fn` inyectable (antes tenía una fórmula fija — se añadió el punto de extensión justo cuando apareció un segundo tipo de label real que lo justificaba, no antes) y `realized_volatility_label` (`src/datasets/labels.py`). El experimento (`scripts/realized_volatility_experiment.py`) corre su propio bucle walk-forward (no reutiliza `WalkForwardEvaluator`, acoplado a accuracy direccional, que no aplica a un target siempre positivo), midiendo R² y correlación de Pearson. 5 tests nuevos.
+
+**Resultado — 15m→30min (312.063 velas, el mismo horizonte usado en todo el proyecto):**
+
+| | Dev (media 5 folds) | Holdout |
+|---|---|---|
+| Modelo (XGBoost) | R²=0.108 | **R²=0.195, corr=0.52** |
+| Baseline de persistencia | R²=-0.169 | R²=-0.162, corr=0.42 |
+
+El modelo bate a la baseline con claridad y de forma consistente en los 5 folds de dev (positivo en los 5; la baseline es negativa en 4 de 5, peor que predecir la media). Un R² de 0.195 y correlación de 0.52 es, con diferencia, **el resultado más fuerte de todo el proyecto** — nada que ver con el 51-52% de accuracy direccional que rondaba el azar.
+
+**Resultado — 1d→30 días (3.028 filas, el horizonte que haría falta para operar contra DVOL):**
+
+| | Dev (media 3 folds) | Holdout |
+|---|---|---|
+| Modelo (XGBoost) | R²=-0.584 | R²=-0.429, corr=0.21 |
+| Baseline de persistencia | R²=-0.836 | R²=-0.869, corr=0.13 |
+
+Aquí el modelo bate a la baseline (que es aún peor), pero **ambos tienen R² negativo** — peor que predecir simplemente la media histórica. Hay algo de correlación (0.21 en holdout), pero no un ajuste fiable. Con solo 3.028 filas y 3 folds, el resultado es además mucho más ruidoso que el de 15m.
+
+**Qué significa esto (y por qué no es un "sí, seguimos" simple):** la volatilidad **sí es predecible en este dataset** — la premisa central de la Fase 1 queda confirmada, y con el resultado más contundente visto en el proyecto. Pero hay un desajuste real: el horizonte donde hay señal fuerte (30 minutos) no es el horizonte al que cotiza DVOL (30 días, la única fuente de "precio de mercado de la volatilidad" gratuita y verificada), y el horizonte que sí encajaría con DVOL no muestra señal fiable con los datos disponibles. Operar la señal de 30 minutos vía opciones exigiría opciones de vencimiento muy corto (Deribit las tiene, pero con muchísima menos liquidez e historial gratuito verificado que DVOL a 30 días) — no es la ruta barata que se investigó.
+
+**Qué queda fuera deliberadamente (decisión pendiente, no bloqueante):** no se ha construido nada de Deribit/DVOL ni motor de backtest de opciones todavía. La Fase 2 tal como se planteó originalmente (comparar predicción a 30 días contra DVOL) no está justificada con este resultado. La alternativa más prometedora con la señal de 30 minutos que sí funciona es monetizarla sin opciones: usarla para decidir cuándo operar el modelo direccional existente (mismo patrón que el filtrado por confianza de 4.10/4.11, pero filtrando por volatilidad esperada en vez de por la magnitud de la propia predicción direccional) — pendiente de decidir con el usuario antes de construir.
+
+**Barrido ampliado — ¿hay un horizonte intermedio (ej. semanal) que funcione mejor?** Dado que las opciones semanales son el vencimiento más líquido de Deribit (más que 30 días o vencimientos ultra-cortos), se amplió el experimento a un barrido completo de horizontes construidos sobre velas de 1h (~78.000 filas — igual de densas para cualquier horizonte, a diferencia de construir un horizonte semanal sobre velas diarias, que solo daría ~3.000 filas):
+
+| Horizonte | Modelo R² (holdout) | Modelo corr | Baseline R² | Baseline corr |
+|---|---|---|---|---|
+| 15m→30min | 0.195 | 0.520 | -0.162 | 0.419 |
+| 1h→4h | **0.265** | 0.552 | -0.302 | 0.349 |
+| 1h→1d | **0.235** | **0.608** | -0.097 | 0.452 |
+| 1h→3d | -0.039 | 0.528 | -0.127 | 0.437 |
+| 1h→7d | -0.536 | 0.313 | -0.184 | 0.438 |
+| 1h→14d | -0.807 | 0.059 | -0.556 | 0.349 |
+| 1d→30d | -0.429 | 0.206 | -0.869 | 0.126 |
+
+**Resultado:** la señal real está concentrada en horizontes cortos — de 30 minutos a **1 día** el modelo bate con claridad a la baseline en R² y en correlación, y el mejor resultado de todo el barrido es 1h→1d (R²=0.235, corr=0.608). A partir de 3 días la cosa se degrada rápido: en 1h→7d y 1h→14d el modelo no solo deja de batir a la baseline, **queda peor que ella** (R² más negativo). Los folds de dev en esos horizontes muestran errores puntuales enormes (R² de fold hasta -7), probablemente por cambios de régimen (crashes, colapsos) que el modelo no anticipa a esa distancia — mientras que la correlación se mantiene razonable hasta 7 días (0.31) y solo se hunde en 14 días (0.06), lo que sugiere que el modelo "acierta el orden" (más o menos vol que lo normal) incluso cuando falla en la magnitud exacta.
+
+**Qué significa esto:** la hipótesis de operar en semanal **no se sostiene con estos datos** — 7 días ya muestra degradación clara, y 14 días prácticamente no tiene señal. El punto dulce real es más corto de lo que ofrecen los vencimientos líquidos habituales de Deribit (semanal como mínimo) — así que el desajuste de vencimiento con el mercado de opciones sigue ahí, solo que ahora sabemos que es peor de lo que parecía: ni siquiera semanal encaja con el horizonte donde el modelo funciona bien.
+
+### 4.14. ¿Y predecir *dirección* (no volatilidad) a intervalos más largos, tipo semanal?
+
+**Qué es:** pregunta relacionada pero distinta a 4.13 — no volatilidad, sino volver a la dirección (subida/bajada) de siempre, pero operando con menos frecuencia. Ya había un indicio en [4.10](#410-capa-de-evaluation--srcevaluation): `1d→3días` parecía competitivo en dev (51.2%) pero se hundía a 47.6% en holdout, achacado a ruido de un dataset pequeño (3.257 filas). Se repitió correctamente esta vez, con el mismo truco que en 4.13: construir los horizontes largos sobre velas de 1h (~78.000 filas) en vez de velas diarias, para tener una muestra grande y fiable — reutilizando sin cambios `WalkForwardEvaluator`, `XGBoostTrainer` y `directional_accuracy` ya existentes (`scripts/direction_horizon_sweep.py`).
+
+**Resultado — accuracy direccional, hiperparámetros por defecto:**
+
+| Horizonte | Dev (media 5 folds) | Holdout |
+|---|---|---|
+| 1h→4h | 50.58% | 50.34% |
+| 1h→1d | 49.01% | 50.32% |
+| 1h→3d | 48.36% | 46.59% |
+| 1h→7d | 47.96% | 46.40% |
+| 1h→14d | 46.88% | 46.18% |
+
+**Resultado inequívoco: cuanto más largo el horizonte, peor la accuracy direccional — de forma monótona.** No es ruido de dataset pequeño (esta vez con ~78.000 filas): la degradación es clara y consistente en dev y holdout por igual, y a partir de 3 días la accuracy cae claramente por debajo del azar (llegando a 46.2% en 14 días — peor que lanzar una moneda de forma sistemática, no solo "sin edge"). Confirma con una muestra grande lo que el resultado de `4h→24h` en 4.10 ya apuntaba con una muestra más pequeña.
+
+**Qué significa esto:** operar dirección a intervalos más espaciados (semanal o más) **no es viable** — es la dirección equivocada de la palanca. La dirección de BTC/USDT es más predecible cuanto más corto el horizonte (aunque siga sin ser explotable por costes, ver [9](#9-próximo-paso-inmediato)), no menos; alargar el horizonte para operar con menos frecuencia empeora la señal en vez de simplemente reducir el número de operaciones. Esto es coherente con 4.13: la señal predecible en este mercado (tanto en dirección como en volatilidad) vive en horas, no en días ni semanas.
+
 ---
 
 ## 5. Cómo encaja todo: flujo de punta a punta (ejemplo real)
@@ -297,7 +394,7 @@ Provider → MarketBar → DataManager → Parquet Storage   ✅ HECHO
 
 **Segundo timeframe — 15 minutos:** el objetivo del proyecto incluye explícitamente predecir sobre un horizonte de 30 minutos (ver [sección 1](#1-qué-es-market-predictor)), pero `DatasetBuilder` exige que el horizonte sea múltiplo exacto de la duración de la vela — imposible con solo velas de 1h. `scripts/sync_data.py` y `scripts/backfill_data.py` ahora iteran sobre una tupla `TIMEFRAMES` en vez de un único `TimeFrame`. Se añadió `TimeFrame.FIFTEEN_MINUTES` (divide exacto en 30 min): 312.063 velas (2017-08-17 → hoy), huecos igual de insignificantes (33 filas, ~565 slots de 15 min sobre 312.000). Validado: `DatasetBuilder.build(bars_15m, TimeFrame.FIFTEEN_MINUTES, timedelta(minutes=30))` ya no lanza error y produce 311.862 filas limpias.
 
-**Timeframes adicionales — 4 horas y 1 día:** distinto motivo al de 15m. Los horizontes de 4h/24h ya se pueden calcular sobre velas de 1h (4 y 24 velas respectivamente) — no hacían falta velas nativas de 4h/1d para eso. La razón real para tenerlas es otra: un indicador calculado sobre velas diarias nativas (ej. RSI diario) mide tendencia macro, información distinta a la del mismo indicador sobre velas de 1h — útil para features multi-timeframe en el futuro (tendencia macro + entrada a corto plazo). No se ha construido esa capa de features todavía (sería sobre-diseñar sin haber entrenado antes un modelo base que muestre que hace falta), pero descargar las velas en sí es barato, así que se hizo ya para no depender de red más adelante: 19.524 velas de 4h y 3.257 de 1d.
+**Timeframes adicionales — 4 horas y 1 día:** distinto motivo al de 15m. Los horizontes de 4h/24h ya se pueden calcular sobre velas de 1h (4 y 24 velas respectivamente) — no hacían falta velas nativas de 4h/1d para eso. La razón real para tenerlas es otra: un indicador calculado sobre velas diarias nativas (ej. RSI diario) mide tendencia macro, información distinta a la del mismo indicador sobre velas de 1h — útil para features multi-timeframe (tendencia macro + entrada a corto plazo). Esa capa de features (`MultiTimeframeFeatureCalculator`) ya se construyó y se probó — ver [4.11](#411-contexto-multi-timeframe--intento-y-resultado); se descargaron 19.524 velas de 4h y 3.257 de 1d desde el principio para no depender de red al construirla.
 
 **Qué queda fuera deliberadamente (no bloqueante para seguir):** un solo horizonte por llamada a `build()` — si en el futuro se quiere entrenar sobre varios horizontes a la vez, se llama a `build()` una vez por horizonte; no se ha añadido soporte multi-horizonte porque no hay evidencia todavía de que haga falta.
 
@@ -379,9 +476,28 @@ Para quien continúe el proyecto, estas son las convenciones que se han seguido 
 
 ## 9. Próximo paso inmediato
 
-La búsqueda exhaustiva (32 configuraciones, 2 modelos, 4 combinaciones timeframe/horizonte) ya corrió con validación estricta: ganador **XGBoost a 15m→30min, 51.6% dev / 51.8% holdout** — una mejora real pero modesta sobre el azar (ver [4.10](#410-capa-de-evaluation--srcevaluation)). Antes de construir **`src/prediction/`** (servir esto en producción), conviene responder dos preguntas que la búsqueda actual no responde:
+Las dos preguntas que quedaban abiertas tras la búsqueda exhaustiva ya se respondieron, ambas con resultado negativo:
 
-1. **¿La señal sobrevive a costes reales?** 51.8% de accuracy direccional a 30 minutos no dice nada sobre si es rentable una vez se descuentan comisión y spread de Binance — un backtest simple con costes de transacción (aunque sea aproximado, sin construir todavía la capa `evaluation/` de métricas de estrategia completa) es el filtro más barato antes de invertir en servir el modelo.
-2. **¿Es estadísticamente robusta o suerte de la búsqueda?** Se probaron 32 configuraciones; un bootstrap sobre los folds del ganador (o repetir con distintas semillas) daría más confianza en que el 51.6%-51.8% no es ruido con buena pinta.
+1. **¿La señal sobrevive a costes reales?** No. El backtest con costes de Binance (ver [4.10](#410-capa-de-evaluation--srcevaluation)) muestra que las 4 combinaciones timeframe/horizonte pierden dinero neto; en el mejor caso (15m→30min) el edge bruto por operación es ~23 veces menor que el coste de una operación de ida y vuelta.
+2. **¿Un edge algo mayor, filtrando por confianza o añadiendo contexto multi-timeframe, cambia eso?** Tampoco. Ni filtrar por las predicciones de mayor magnitud ni añadir RSI/tendencia de 4h y 1d al dataset de 15m (ver [4.11](#411-contexto-multi-timeframe--intento-y-resultado)) produce un umbral con retorno neto positivo en dev, y ambas ideas se confirmaron una sola vez sobre el holdout con el mismo resultado: la mejora en accuracy direccional es real (51.6%→51.77% dev, 51.8%→51.88% holdout con contexto multi-timeframe) pero demasiado pequeña frente a un coste de 20 puntos básicos por operación. Añadir funding rate de futuros perpetuos como fuente de información distinta al precio ([4.12](#412-funding-rate-de-futuros-perpetuos--intento-y-resultado)) tampoco ayudó — ni siquiera superó el baseline en dev (51.36% vs 51.6%), así que ese intento paró ahí sin tocar el holdout.
 
-Si ambas resisten, entonces sí tiene sentido construir `src/prediction/` sobre el modelo ya guardado (`models/best_xgboost_15m_03000.joblib`). Si no, la palanca más prometedora sería revisar las features (multi-timeframe, usando las velas de 4h/1d ya descargadas) antes que seguir probando más modelos sobre las mismas 32 columnas actuales.
+**Conclusión:** con indicadores técnicos clásicos — solos o combinados entre timeframes — BTC/USDT a granularidad de 15-30 minutos no da suficiente edge direccional para superar comisiones estándar de Binance. No tiene sentido seguir iterando sobre este mismo tipo de features esperando que la siguiente variante cruce el umbral; construir **`src/prediction/`** sobre cualquiera de los modelos actuales serviría una estrategia que pierde dinero por diseño, no por falta de afinar. Antes de invertir más en `src/prediction/`, las palancas con más probabilidad de cambiar el panorama son de otro tipo, no más ingeniería de indicadores sobre las mismas velas:
+
+- **Reducir frecuencia de operación de raíz**, no solo filtrar predicciones: operar en timeframes más altos donde el coste pesa menos por operación (ya se probó 1h/4h/1d en el backtest, todos también en pérdidas, pero con menos operaciones el listón para ser rentable es más bajo si el edge mejora).
+- **Otra fuente de información**, no otro indicador sobre el mismo precio: datos de order book/microestructura, funding rate de futuros, o señales fuera de precio (on-chain, sentimiento) — los indicadores técnicos clásicos ya están explorados en varias combinaciones (single-timeframe y multi-timeframe) sin cruzar el umbral.
+- **Replantear el objetivo**: en vez de predecir dirección para operar cada vela, usar la magnitud predicida para dimensionar posición en una estrategia de menor frecuencia, o predecir volatilidad en vez de dirección.
+
+Si ninguna de estas resulta prometedora, la conclusión honesta del proyecto en su forma actual es que BTC/USDT a corto plazo con features de precio clásicas no es un caso de uso rentable — un resultado legítimo de la investigación, no un fallo de implementación.
+
+**Lever 1 descartado — análisis de coste de equilibrio (`scripts/breakeven_cost_analysis.py`):** antes de invertir en la vía 2 (otra fuente de datos, la más cara de construir), se comprobó primero si simplemente pagar menos comisión bastaría. Sin reentrenar nada, se recalculó cuál sería el coste de ida y vuelta que dejaría cada estrategia exactamente en tablas (el retorno bruto medio por operación *es*, por definición, ese coste de equilibrio):
+
+| Modelo | keep_fraction | Nº operaciones (holdout) | Coste de equilibrio |
+|---|---|---|---|
+| Solo 15m | 1.0 (sin filtrar) | 46.779 | 0.87 pb |
+| Solo 15m | 0.05 (mejor caso) | 746 | 7.85 pb |
+| 15m + contexto | 1.0 (sin filtrar) | 43.957 | 0.75 pb |
+| 15m + contexto | 0.05 | 1.311 | 1.90 pb |
+
+El esquema real de comisiones de Binance Spot (VIP0, verificado): 0.1000% maker / 0.1000% taker (20 pb ida y vuelta, el supuesto ya usado en este documento); pagando con BNB, 25% de descuento → 0.075%/0.075% (**15 pb ida y vuelta**, el mejor coste realista sin requisitos de volumen o holdings grandes). Los tiers VIP superiores bajan más, pero VIP1 ya exige 250.000 $ de volumen en 30 días o mantener 25 BNB, y los tiers realmente baratos (≈2-4 pb) exigen más de 2.000 millones $/mes — inalcanzable para este proyecto.
+
+**Conclusión:** incluso en el escenario de coste más optimista y realista (15 pb con descuento BNB), ninguna configuración se acerca a ser rentable — el mejor caso encontrado (7.85 pb, con solo 746 operaciones en el holdout, una muestra pequeña y por tanto poco fiable) sigue siendo menos de la mitad de ese coste. Haría falta más que duplicar el edge actual del modelo para que bajar de comisión, por sí solo, cerrara la brecha. **La palanca 1 (atacar el coste) queda descartada como solución por sí sola** — no es un problema de qué tier de Binance usar, es que el edge del modelo es demasiado pequeño incluso para el mejor coste alcanzable. La vía con más recorrido real sigue siendo la 2 (otra fuente de información) o la 3 (replantear el objetivo).

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import Sequence, Tuple
+from typing import Callable, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -13,22 +13,36 @@ from src.features import FeatureCalculator
 
 _RAW_PRICE_COLUMNS = ("open", "high", "low", "close", "volume")
 
+LabelFn = Callable[[pd.DataFrame, int], pd.Series]
+
 
 class DatasetBuilder:
     """Build a model-ready ``(X, y)`` table from raw bars.
 
     Combines the feature matrix produced by a ``FeatureCalculator`` with a
-    future log-return label over a configurable horizon. Raw OHLCV columns
-    are excluded from ``X``: they are not comparable across instruments with
-    different price scales, so only engineered, scale-relative columns
-    (indicators, past returns, temporal encodings) are used as features.
+    label over a configurable horizon. Raw OHLCV columns are excluded from
+    ``X``: they are not comparable across instruments with different price
+    scales, so only engineered, scale-relative columns (indicators, past
+    returns, temporal encodings) are used as features.
 
     Args:
         feature_calculator: Produces the feature matrix from raw bars.
+        label_fn: Computes the label column from the feature-calculator's
+            output DataFrame (which still has the raw OHLCV columns at this
+            point) and the horizon expressed in bars. Defaults to the
+            future signed log-return, ``ln(close[t + horizon] / close[t])``.
+            Injectable because a second real label (realized volatility, see
+            ``src/datasets/labels.py``) now exists -- see project rule
+            against introducing abstractions before a second use case does.
     """
 
-    def __init__(self, feature_calculator: FeatureCalculator) -> None:
+    def __init__(
+        self,
+        feature_calculator: FeatureCalculator,
+        label_fn: Optional[LabelFn] = None,
+    ) -> None:
         self._feature_calculator = feature_calculator
+        self._label_fn = label_fn or self._future_log_return
 
     def build(
         self,
@@ -60,12 +74,17 @@ class DatasetBuilder:
         bars_per_horizon = self._bars_per_horizon(timeframe, horizon)
 
         df = self._feature_calculator.compute(bars)
-        df["label"] = np.log(df["close"].shift(-bars_per_horizon) / df["close"])
+        df["label"] = self._label_fn(df, bars_per_horizon)
         df = df.dropna()
 
         y = df["label"]
         x = df.drop(columns=["label", *_RAW_PRICE_COLUMNS])
         return x, y
+
+    @staticmethod
+    def _future_log_return(df: pd.DataFrame, bars_per_horizon: int) -> pd.Series:
+        """Default label: future signed log-return, ``ln(close[t+h] / close[t])``."""
+        return np.log(df["close"].shift(-bars_per_horizon) / df["close"])
 
     @staticmethod
     def _bars_per_horizon(timeframe: TimeFrame, horizon: timedelta) -> int:
